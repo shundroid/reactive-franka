@@ -17,10 +17,22 @@ CUP_ANGULAR_SPEED = 0.55  # rad/s; peak speed 5.5 cm/s, matching the red obstacl
 
 
 class Simulation:
-    def __init__(self, gui: bool, output: Path):
+    def __init__(self, gui: bool, output: Path, gui_light: bool = False):
         self.client = p.connect(p.GUI if gui else p.DIRECT)
         if self.client < 0:
             raise RuntimeError("Could not connect to PyBullet")
+        if gui and gui_light:
+            # Only the desktop viewport changes. The RGB-D camera keeps TinyRenderer
+            # and its original resolution, so YOLO/ICP and control inputs stay identical.
+            for flag in (
+                p.COV_ENABLE_GUI,
+                p.COV_ENABLE_RGB_BUFFER_PREVIEW,
+                p.COV_ENABLE_DEPTH_BUFFER_PREVIEW,
+                p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW,
+                p.COV_ENABLE_SHADOWS,
+                p.COV_ENABLE_PLANAR_REFLECTION,
+            ):
+                p.configureDebugVisualizer(flag, 0, physicsClientId=self.client)
         p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=self.client)
         p.setGravity(0, 0, -9.81, physicsClientId=self.client)
         p.setTimeStep(1 / 240, physicsClientId=self.client)

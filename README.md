@@ -30,6 +30,9 @@ The first run may take longer while CUDA kernels compile.
 The GUI opens by default. The loop is **pick → place → go home → repeat**.
 Press **Ctrl-C** to stop. Images and logs are saved to `outputs/`.
 
+For a lighter remote GUI, add `--gui-light`. This hides debug previews and disables
+viewport shadows and reflections; the observation camera is unchanged.
+
 To run two cycles without a GUI:
 
 ```bash

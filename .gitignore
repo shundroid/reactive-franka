@@ -6,3 +6,5 @@ __pycache__/
 outputs/
 *.pt
 !weights/cup-handle-seg.pt
+
+.leo/

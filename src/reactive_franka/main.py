@@ -23,6 +23,11 @@ def parse_args():
         description="Reactive Franka + Kalman-tracked cup + two moving obstacles"
     )
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--gui-light",
+        action="store_true",
+        help="Hide debug previews and disable viewport shadows/reflections for remote GUI",
+    )
     parser.add_argument("--controller", choices=["curobo", "bullet-ik"], default="curobo")
     parser.add_argument("--perception", choices=["yolo", "sim-mask"], default="yolo")
     parser.add_argument("--weights", default="weights/cup-handle-seg.pt")
@@ -40,7 +45,7 @@ def parse_args():
 
 
 def run(args):
-    sim = Simulation(not args.headless, args.output)
+    sim = Simulation(not args.headless, args.output, gui_light=args.gui_light)
     task = PickPlace()
     tracker = PoseKalmanFilter()
     updates_by_phase = {}
