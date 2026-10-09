@@ -43,6 +43,11 @@ uv run --extra gpu --extra vision reactive-franka --headless --fast \
 `--fast` runs without real-time pacing. `--steps` limits the number of control steps.
 A cycle finishes after the robot returns home.
 
+For per-stage timing, add `--profile sync` (wait for CUDA completion) or
+`--profile wall` (no added GPU synchronization). Timings and statistics are saved
+in one `profile.json` under `--output`; the first 30 control steps are excluded
+by default. See [PROFILING.md](PROFILING.md) for stage definitions.
+
 ## Retrain (optional)
 
 Retrain the model if you change the camera position or scene:

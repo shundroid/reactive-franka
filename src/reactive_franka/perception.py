@@ -9,6 +9,7 @@ from scipy.spatial.transform import Rotation
 
 from .camera import Frame
 from .geometry import model_points
+from .profiling import DISABLED_PROFILER
 
 
 @dataclass
@@ -71,99 +72,112 @@ class Perception:
             if self.detector.task != "segment":
                 raise ValueError("Use YOLO segmentation weights, e.g. yolo11n-seg.pt")
 
-    def detect_mask(self, frame: Frame):
+    def detect_mask(self, frame: Frame, *, profiler=DISABLED_PROFILER):
         if self.mode == "sim-mask":
             return frame.body_ids == self.cup_id
+        with profiler.span("yolo.preprocess"):
+            bgr = frame.rgb[..., ::-1].copy()
         # Ultralytics ndarray inputs are BGR. retina_masks returns original resolution.
-        result = self.detector.predict(
-            frame.rgb[..., ::-1].copy(),
-            verbose=False,
-            conf=self.confidence,
-            retina_masks=True,
-            imgsz=640,
-        )[0]
-        if result.masks is None or result.boxes is None:
-            return None
-        candidates = [
-            i for i, cls in enumerate(result.boxes.cls.tolist()) if result.names[int(cls)] == "cup"
-        ]
-        if not candidates:
-            return None
-        # Associate detections with the previously observed cup, not a newly visible
-        # obstacle that YOLO also labels "cup". The bound permits carried-cup motion.
-        if self.last is not None and frame.timestamp - self.last.timestamp < 0.8:
-            plausible = []
-            distance_limit = 0.07 + 0.4 * (frame.timestamp - self.last.timestamp)
-            for index in candidates:
-                mask = result.masks.data[index].cpu().numpy() > 0.5
-                points = frame.points(mask)
-                if (
-                    len(points) >= 40
-                    and np.linalg.norm(np.median(points, axis=0) - self.last.position)
-                    < distance_limit
-                ):
-                    plausible.append(index)
-            candidates = plausible
+        with profiler.span("yolo.inference", gpu=True):
+            result = self.detector.predict(
+                bgr,
+                verbose=False,
+                conf=self.confidence,
+                retina_masks=True,
+                imgsz=640,
+            )[0]
+        with profiler.span("yolo.postprocess", gpu=True):
+            if result.masks is None or result.boxes is None:
+                return None
+            candidates = [
+                i
+                for i, cls in enumerate(result.boxes.cls.tolist())
+                if result.names[int(cls)] == "cup"
+            ]
             if not candidates:
                 return None
-        # Prefer confidence among associated candidates; never substitute simulator labels.
-        index = max(candidates, key=lambda i: float(result.boxes.conf[i]))
-        return result.masks.data[index].cpu().numpy() > 0.5
+            # Associate detections with the previously observed cup, not a newly visible
+            # obstacle that YOLO also labels "cup". The bound permits carried-cup motion.
+            if self.last is not None and frame.timestamp - self.last.timestamp < 0.8:
+                plausible = []
+                distance_limit = 0.07 + 0.4 * (frame.timestamp - self.last.timestamp)
+                for index in candidates:
+                    mask = result.masks.data[index].cpu().numpy() > 0.5
+                    points = frame.points(mask)
+                    if (
+                        len(points) >= 40
+                        and np.linalg.norm(np.median(points, axis=0) - self.last.position)
+                        < distance_limit
+                    ):
+                        plausible.append(index)
+                candidates = plausible
+                if not candidates:
+                    return None
+            # Prefer confidence among associated candidates; never substitute simulator labels.
+            index = max(candidates, key=lambda i: float(result.boxes.conf[i]))
+            return result.masks.data[index].cpu().numpy() > 0.5
 
-    def estimate(self, frame: Frame):
-        mask = self.detect_mask(frame)
+    def estimate(self, frame: Frame, *, profiler=DISABLED_PROFILER):
+        mask = self.detect_mask(frame, profiler=profiler)
         if mask is None:
             return None
-        points = frame.points(binary_erosion(mask, iterations=1))
-        if len(points) < 40:
-            return None
-        points = points[:: max(1, len(points) // 900)]
-        center = np.median(points, axis=0)
-        # The fixed camera also observes the cup while it is lifted/transported.
-        points = points[(points[:, 2] > 0.005) & (points[:, 2] < 0.85)]
-        if len(points) < 40:
-            return None
-        initial = np.eye(4)
-        initial[:3, 3] = [center[0], center[1], max(0.051, np.percentile(points[:, 2], 95) - 0.05)]
-        if self.last is not None and frame.timestamp - self.last.timestamp < 0.5:
-            # Keep a current-cloud seed as well: a carried cup can move farther than
-            # ICP's correspondence radius between camera frames.
-            seed = self.last.world_from_object.copy()
-            seed[:3, 3] = initial[:3, 3]
-            seeds = [self.last.world_from_object, seed]
-        else:
-            seeds = []
-            for yaw in np.linspace(0, 2 * np.pi, 8, endpoint=False):
-                seed = initial.copy()
-                seed[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
-                seeds.append(seed)
-        fits = [upright_icp(self.model, points, seed) for seed in seeds]
-        transform, rmse, fraction = min(fits, key=lambda fit: fit[1] + 0.02 * (1 - fit[2]))
-        if (
-            rmse > 0.008
-            or fraction < 0.65
-            or not 0.025 < transform[2, 3] < 0.8
-            or not 0.30 < transform[0, 3] < 0.78
-            or abs(transform[1, 3]) > 0.42
-        ):
-            return None
-        # The cylindrical body cannot constrain yaw. Use visible points beyond its
-        # radius as handle evidence; absent handle evidence still contributes XYZ.
-        radial = points[:, :2] - transform[:2, 3]
-        distance = np.linalg.norm(radial, axis=1)
-        handle = (
-            (distance > 0.040)
-            & (distance < 0.072)
-            & (np.abs(points[:, 2] - transform[2, 3] - 0.005) < 0.032)
-        )
-        yaw_observed = False
-        if handle.sum() >= 6:
-            directions = radial[handle] / distance[handle, None]
-            direction = directions.mean(axis=0)
-            if np.linalg.norm(direction) > 0.95:
-                yaw = np.arctan2(direction[1], direction[0])
-                transform[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
-                yaw_observed = True
-        estimate = Estimate(transform, mask, frame.timestamp, rmse, fraction, yaw_observed)
-        self.last = estimate
-        return estimate
+        with profiler.span("pose.preprocess"):
+            points = frame.points(binary_erosion(mask, iterations=1))
+            if len(points) < 40:
+                return None
+            points = points[:: max(1, len(points) // 900)]
+            center = np.median(points, axis=0)
+            # The fixed camera also observes the cup while it is lifted/transported.
+            points = points[(points[:, 2] > 0.005) & (points[:, 2] < 0.85)]
+            if len(points) < 40:
+                return None
+            initial = np.eye(4)
+            initial[:3, 3] = [
+                center[0],
+                center[1],
+                max(0.051, np.percentile(points[:, 2], 95) - 0.05),
+            ]
+            if self.last is not None and frame.timestamp - self.last.timestamp < 0.5:
+                # Keep a current-cloud seed as well: a carried cup can move farther than
+                # ICP's correspondence radius between camera frames.
+                seed = self.last.world_from_object.copy()
+                seed[:3, 3] = initial[:3, 3]
+                seeds = [self.last.world_from_object, seed]
+            else:
+                seeds = []
+                for yaw in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+                    seed = initial.copy()
+                    seed[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
+                    seeds.append(seed)
+        with profiler.span("icp.fit"):
+            fits = [upright_icp(self.model, points, seed) for seed in seeds]
+        with profiler.span("pose.postprocess"):
+            transform, rmse, fraction = min(fits, key=lambda fit: fit[1] + 0.02 * (1 - fit[2]))
+            if (
+                rmse > 0.008
+                or fraction < 0.65
+                or not 0.025 < transform[2, 3] < 0.8
+                or not 0.30 < transform[0, 3] < 0.78
+                or abs(transform[1, 3]) > 0.42
+            ):
+                return None
+            # The cylindrical body cannot constrain yaw. Use visible points beyond its
+            # radius as handle evidence; absent handle evidence still contributes XYZ.
+            radial = points[:, :2] - transform[:2, 3]
+            distance = np.linalg.norm(radial, axis=1)
+            handle = (
+                (distance > 0.040)
+                & (distance < 0.072)
+                & (np.abs(points[:, 2] - transform[2, 3] - 0.005) < 0.032)
+            )
+            yaw_observed = False
+            if handle.sum() >= 6:
+                directions = radial[handle] / distance[handle, None]
+                direction = directions.mean(axis=0)
+                if np.linalg.norm(direction) > 0.95:
+                    yaw = np.arctan2(direction[1], direction[0])
+                    transform[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
+                    yaw_observed = True
+            estimate = Estimate(transform, mask, frame.timestamp, rmse, fraction, yaw_observed)
+            self.last = estimate
+            return estimate

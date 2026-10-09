@@ -5,6 +5,8 @@ import pybullet as p
 from scipy.ndimage import binary_dilation
 from scipy.spatial.transform import Rotation
 
+from .profiling import DISABLED_PROFILER
+
 
 def mapping_depth(frame, robot_id, target_mask):
     depth = frame.depth.copy()
@@ -21,10 +23,10 @@ class BulletIK:
     def __init__(self, sim):
         self.sim = sim
 
-    def update_map(self, frame, target_mask):
+    def update_map(self, frame, target_mask, *, profiler=DISABLED_PROFILER):
         pass
 
-    def command(self, position, quat_xyzw):
+    def command(self, position, quat_xyzw, *, profiler=DISABLED_PROFILER):
         q, _ = self.sim.joints()
         goal = p.calculateInverseKinematics(
             self.sim.robot,
@@ -127,66 +129,81 @@ class CuroboMPC:
         )
         return state
 
-    def update_map(self, frame, target_mask):
+    def update_map(self, frame, target_mask, *, profiler=DISABLED_PROFILER):
         from curobo.types import CameraObservation, Pose
 
-        depth = mapping_depth(frame, self.sim.robot, target_mask)
-        quat = Rotation.from_matrix(frame.world_from_camera[:3, :3]).as_quat()
-        pose = Pose.from_list(
-            [*frame.world_from_camera[:3, 3], quat[3], *quat[:3]], device_cfg=self.device_cfg
-        )
-        observation = CameraObservation(
-            name="bullet",
-            depth_image=self.tensor(depth)[None],
-            rgb_image=self.torch.as_tensor(frame.rgb.copy(), device="cuda:0")[None],
-            intrinsics=self.tensor(frame.intrinsics)[None],
-            pose=pose,
-            timestamp=frame.timestamp,
-        )
-        self.mapper.integrate(observation)
-        grid = self.mapper.compute_esdf()
-        if self.grid is None:
-            self.grid = grid
-        elif self.grid.feature_tensor.data_ptr() != grid.feature_tensor.data_ptr():
-            # Keep the scene tensor address stable for captured CUDA graphs.
-            self.grid.feature_tensor.copy_(grid.feature_tensor)
+        with profiler.span("mapping.depth_filter"):
+            depth = mapping_depth(frame, self.sim.robot, target_mask)
+        with profiler.span("mapping.upload", gpu=True):
+            quat = Rotation.from_matrix(frame.world_from_camera[:3, :3]).as_quat()
+            pose = Pose.from_list(
+                [*frame.world_from_camera[:3, 3], quat[3], *quat[:3]],
+                device_cfg=self.device_cfg,
+            )
+            observation = CameraObservation(
+                name="bullet",
+                depth_image=self.tensor(depth)[None],
+                rgb_image=self.torch.as_tensor(frame.rgb.copy(), device="cuda:0")[None],
+                intrinsics=self.tensor(frame.intrinsics)[None],
+                pose=pose,
+                timestamp=frame.timestamp,
+            )
+        with profiler.span("mapping.tsdf", gpu=True):
+            self.mapper.integrate(observation)
+        with profiler.span("mapping.esdf", gpu=True):
+            grid = self.mapper.compute_esdf()
+        with profiler.span("mapping.publish", gpu=True):
+            if self.grid is None:
+                self.grid = grid
+            elif self.grid.feature_tensor.data_ptr() != grid.feature_tensor.data_ptr():
+                # Keep the scene tensor address stable for captured CUDA graphs.
+                self.grid.feature_tensor.copy_(grid.feature_tensor)
 
-    def command(self, position, quat_xyzw):
+    def command(self, position, quat_xyzw, *, profiler=DISABLED_PROFILER):
         from curobo.types import GoalToolPose, Pose
 
-        state = self.state()  # Bullet position/velocity and ideal-servo acceleration
-        poses = self.mpc.compute_kinematics(state).tool_poses.to_dict()
-        poses[self.mpc.tool_frames[0]] = Pose.from_list(
-            [*position, quat_xyzw[3], *quat_xyzw[:3]], device_cfg=self.device_cfg
-        )
-        goal = GoalToolPose.from_poses(
-            poses, ordered_tool_frames=self.mpc.tool_frames, num_goalset=1
-        )
-        self.mpc.update_goal_tool_poses(goal, run_ik=False)
-        result = self.mpc.optimize_action_sequence(state)
-        action = result.action_sequence
-        # v2 reports whole-horizon feasibility in `success`; inspect the executed
-        # interval itself so an obstacle near the distant goal does not freeze MPC.
-        metrics = self.mpc.trajectory_execution_manager.get_current_metrics()
-        feasible_steps = metrics.costs_and_constraints.get_feasible(
-            include_all_hybrid=False, sum_horizon=False
-        )
-        feasible = (
-            feasible_steps
-            if isinstance(feasible_steps, bool)
-            else bool(feasible_steps[:, 4:8].all().item())
-        )
-        if action is None or not feasible or not bool(self.torch.isfinite(action.position).all()):
-            self.failures += 1
-            q = self.sim.joints()[0]
-            self.sim.ideal_trajectory = q[None]
-            self.sim.ideal_velocity = np.zeros((1, 7))
-            self.last_acceleration = self.torch.zeros_like(state.position)
-            self.mpc.reset_robot(state)
-            return q
-        self.failures = 0
-        target = action.position.detach().cpu().numpy().reshape(-1, 7)[-1, self.indices]
-        self.last_acceleration = action.acceleration[:, -1, :].clone()
-        self.sim.ideal_trajectory = action.position[0, :, self.indices].detach().cpu().numpy()
-        self.sim.ideal_velocity = action.velocity[0, :, self.indices].detach().cpu().numpy()
-        return target
+        with profiler.span("mpc.state_upload", gpu=True):
+            state = self.state()  # Bullet position/velocity and ideal-servo acceleration
+        with profiler.span("mpc.goal_setup", gpu=True):
+            poses = self.mpc.compute_kinematics(state).tool_poses.to_dict()
+            poses[self.mpc.tool_frames[0]] = Pose.from_list(
+                [*position, quat_xyzw[3], *quat_xyzw[:3]], device_cfg=self.device_cfg
+            )
+            goal = GoalToolPose.from_poses(
+                poses, ordered_tool_frames=self.mpc.tool_frames, num_goalset=1
+            )
+            self.mpc.update_goal_tool_poses(goal, run_ik=False)
+        with profiler.span("mpc.optimize", gpu=True):
+            result = self.mpc.optimize_action_sequence(state)
+        with profiler.span("mpc.validate", gpu=True):
+            action = result.action_sequence
+            # v2 reports whole-horizon feasibility in `success`; inspect the executed
+            # interval itself so an obstacle near the distant goal does not freeze MPC.
+            metrics = self.mpc.trajectory_execution_manager.get_current_metrics()
+            feasible_steps = metrics.costs_and_constraints.get_feasible(
+                include_all_hybrid=False, sum_horizon=False
+            )
+            feasible = (
+                feasible_steps
+                if isinstance(feasible_steps, bool)
+                else bool(feasible_steps[:, 4:8].all().item())
+            )
+            if (
+                action is None
+                or not feasible
+                or not bool(self.torch.isfinite(action.position).all())
+            ):
+                self.failures += 1
+                q = self.sim.joints()[0]
+                self.sim.ideal_trajectory = q[None]
+                self.sim.ideal_velocity = np.zeros((1, 7))
+                self.last_acceleration = self.torch.zeros_like(state.position)
+                self.mpc.reset_robot(state)
+                return q
+        with profiler.span("mpc.download", gpu=True):
+            self.failures = 0
+            target = action.position.detach().cpu().numpy().reshape(-1, 7)[-1, self.indices]
+            self.last_acceleration = action.acceleration[:, -1, :].clone()
+            self.sim.ideal_trajectory = action.position[0, :, self.indices].detach().cpu().numpy()
+            self.sim.ideal_velocity = action.velocity[0, :, self.indices].detach().cpu().numpy()
+            return target
