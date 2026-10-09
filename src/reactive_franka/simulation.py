@@ -67,13 +67,14 @@ class Simulation:
             physicsClientId=self.client,
         )
         collision = cup_collision(self.client)
-        self.cup = p.createMultiBody(0, collision, visual, STATIONS[0], physicsClientId=self.client)
+        cup_orientation = p.getQuaternionFromEuler([0, 0, np.pi])
+        self.cup = p.createMultiBody(0, collision, visual, STATIONS[0], baseOrientation=cup_orientation, physicsClientId=self.client)
         self.camera = Camera(self.client)
         self.time = 0.0
         self.station = 0
         self.motion_origin = STATIONS[0].copy()
         self.motion_started = 0.0
-        self.motion_orientation = [0, 0, 0, 1]
+        self.motion_orientation = cup_orientation
         self.moving = True
         self.constraint = None
         self.command = np.array(HOME)
