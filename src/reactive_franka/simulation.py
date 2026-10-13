@@ -18,6 +18,9 @@ CUP_ANGULAR_SPEED = 0.55  # rad/s; peak speed 5.5 cm/s, matching the red obstacl
 
 class Simulation:
     def __init__(self, gui: bool, output: Path, gui_light: bool = False):
+        self.gui = gui
+        self.status_text = None
+        self.status_item = -1
         self.client = p.connect(p.GUI if gui else p.DIRECT)
         if self.client < 0:
             raise RuntimeError("Could not connect to PyBullet")
@@ -68,7 +71,14 @@ class Simulation:
         )
         collision = cup_collision(self.client)
         cup_orientation = p.getQuaternionFromEuler([0, 0, np.pi])
-        self.cup = p.createMultiBody(0, collision, visual, STATIONS[0], baseOrientation=cup_orientation, physicsClientId=self.client)
+        self.cup = p.createMultiBody(
+            0,
+            collision,
+            visual,
+            STATIONS[0],
+            baseOrientation=cup_orientation,
+            physicsClientId=self.client,
+        )
         self.camera = Camera(self.client)
         self.time = 0.0
         self.station = 0
@@ -80,6 +90,19 @@ class Simulation:
         self.command = np.array(HOME)
         self.grip = 0.04
         p.resetDebugVisualizerCamera(1.5, 45, -35, [0.4, 0, 0.2], physicsClientId=self.client)
+
+    def display_status(self, text: str):
+        if not self.gui or text == self.status_text:
+            return
+        self.status_item = p.addUserDebugText(
+            text,
+            [0.0, 0.0, 1.0],
+            textColorRGB=[0.05, 0.05, 0.05],
+            textSize=1.3,
+            replaceItemUniqueId=self.status_item,
+            physicsClientId=self.client,
+        )
+        self.status_text = text
 
     def box(self, position, half, color):
         c = p.createCollisionShape(p.GEOM_BOX, halfExtents=half, physicsClientId=self.client)

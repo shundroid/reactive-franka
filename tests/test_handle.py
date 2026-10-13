@@ -1,18 +1,28 @@
 import numpy as np
 import pybullet as p
+import pytest
+from scipy.spatial.transform import Rotation
 
 from reactive_franka.geometry import HANDLE_CLOSED_GRIP, HANDLE_GRASP, handle_grasp_pose
 from reactive_franka.simulation import HAND_TO_GRASP, STATIONS, Simulation
 
 
-def test_handle_collision_has_outer_arc_and_open_hole(tmp_path):
+@pytest.mark.parametrize("yaw", [0, np.pi])
+def test_handle_collision_has_outer_arc_and_open_hole(tmp_path, yaw):
     sim = Simulation(False, tmp_path)
     try:
+        rotation = Rotation.from_euler("z", yaw)
+        p.resetBasePositionAndOrientation(
+            sim.cup, STATIONS[0], rotation.as_quat(), physicsClientId=sim.client
+        )
         shape = p.createCollisionShape(p.GEOM_SPHERE, radius=0.001, physicsClientId=sim.client)
         probe = p.createMultiBody(0, shape, physicsClientId=sim.client)
         for offset, contact in [(HANDLE_GRASP, True), ([0.043, 0, 0.005], False)]:
             p.resetBasePositionAndOrientation(
-                probe, STATIONS[0] + offset, [0, 0, 0, 1], physicsClientId=sim.client
+                probe,
+                STATIONS[0] + rotation.apply(offset),
+                [0, 0, 0, 1],
+                physicsClientId=sim.client,
             )
             assert (
                 bool(p.getClosestPoints(sim.cup, probe, 0, physicsClientId=sim.client)) == contact
@@ -21,10 +31,17 @@ def test_handle_collision_has_outer_arc_and_open_hole(tmp_path):
         sim.close()
 
 
-def test_only_closed_aligned_handle_grasp_can_attach(tmp_path):
+@pytest.mark.parametrize("yaw", [0, np.pi])
+def test_only_closed_aligned_handle_grasp_can_attach(tmp_path, yaw):
     sim = Simulation(False, tmp_path)
     try:
-        point, quat = handle_grasp_pose(STATIONS[0], 0)
+        p.resetBasePositionAndOrientation(
+            sim.cup,
+            STATIONS[0],
+            Rotation.from_euler("z", yaw).as_quat(),
+            physicsClientId=sim.client,
+        )
+        point, quat = handle_grasp_pose(STATIONS[0], yaw)
 
         def set_gripper(grasp_point, orientation, opening):
             target = grasp_point + [0, 0, HAND_TO_GRASP]
@@ -48,7 +65,7 @@ def test_only_closed_aligned_handle_grasp_can_attach(tmp_path):
         assert not sim.attach()  # The old body-center grasp is no longer accepted.
         set_gripper(point, quat, 0.04)
         assert not sim.attach()  # An open gripper cannot latch the handle.
-        _, wrong_yaw = handle_grasp_pose(STATIONS[0], np.pi / 2)
+        _, wrong_yaw = handle_grasp_pose(STATIONS[0], yaw + np.pi / 2)
         set_gripper(point, wrong_yaw, HANDLE_CLOSED_GRIP)
         assert not sim.attach()
         set_gripper(point, quat, HANDLE_CLOSED_GRIP)

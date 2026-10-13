@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -11,12 +12,39 @@ from PIL import Image
 
 from .control import BulletIK, CuroboMPC
 from .perception import Perception
+from .planning import CuroboPlanner, PlanningError
 from .profiling import DISABLED_PROFILER, Profiler
+from .seed import JointTrajectory
 from .simulation import Simulation
+from .stagnation import StagnationDetector, pose_errors
 from .task import GRASP_PREDICTION_SECONDS, PickPlace
 from .tracking import PoseKalmanFilter
 
 LOG = logging.getLogger(__name__)
+MAX_SEED_POSE_ERROR = np.array([0.02, 0.1])  # meters, radians at a window endpoint
+
+
+@dataclass
+class RecoveryPlan:
+    trajectory: JointTrajectory
+    step: tuple[str, float]
+    started: float
+    next_seed_time: float
+    goal: np.ndarray | None = None
+    quaternion: np.ndarray | None = None
+
+    def stop_reason(self, current_step, now, hand, hand_quaternion):
+        if current_step != self.step:
+            return "task_changed"
+        if now + 1e-9 < self.next_seed_time:
+            return None
+        error = pose_errors(hand, hand_quaternion, self.goal, self.quaternion)
+        if np.any(error > MAX_SEED_POSE_ERROR):
+            LOG.info("t=%.2f seed endpoint deviation=%.3fm / %.3frad", now, error[0], error[1])
+            return "deviation"
+        if now - self.started >= self.trajectory.duration:
+            return "plan_finished"
+        return None
 
 
 def parse_args():
@@ -73,6 +101,12 @@ def run(args):
     steps, detections, collisions = 0, 0, 0
     started = time.monotonic()
     controller = None
+    planner = None
+    stagnation = StagnationDetector()
+    plans = 0
+    recovery = None
+    seed_updates = 0
+    recovery_stop = None
     last_mask = None
     interrupted = False
     error = None
@@ -85,6 +119,7 @@ def run(args):
         last_mask = estimate.mask if estimate is not None else None
         if args.controller == "curobo":
             controller = CuroboMPC(sim, frame, last_mask)
+            planner = CuroboPlanner(controller.robot_config, controller.grid, controller.device_cfg)
         else:
             LOG.warning("Bullet IK diagnostic mode: no MPC or obstacle avoidance")
             controller = BulletIK(sim)
@@ -158,11 +193,88 @@ def run(args):
                         Image.fromarray(sim.camera.capture(sim.time).rgb).save(
                             args.output / "handle-grasp.png"
                         )
+                    step_key = (task.goal_step, task.goal_entered)
+                    hand, hand_quat = sim.hand_pose()
+                    if recovery is not None:
+                        stop_reason = recovery.stop_reason(
+                            (task.step, task.entered), sim.time, hand, hand_quat
+                        )
+                        if stop_reason is not None:
+                            LOG.info(
+                                "t=%.2f recovery ended: %s; continuing MPC", sim.time, stop_reason
+                            )
+                            recovery_stop = stop_reason
+                            recovery = None
+                    # Normal ticks use MPC's own warm start. Only a stalled task
+                    # invokes the independent planner; the detector latches that
+                    # episode so cancellation/failure cannot immediately replan.
+                    stalled = stagnation.update(
+                        sim.time,
+                        step_key,
+                        hand,
+                        hand_quat,
+                        goal,
+                        quat,
+                        task.goal_tolerances,
+                        enabled=(
+                            planner is not None
+                            and recovery is None
+                            and not task.waiting_for_target
+                            and task.goal_step not in ("close", "open")
+                            and step_key == (task.step, task.entered)
+                        ),
+                    )
+                    if stalled:
+                        plans += 1
+                        LOG.info("t=%.2f stalled %s; planning once", sim.time, task.goal_step)
+                        try:
+                            with step_profiler.span("planning.total", gpu=True):
+                                trajectory = planner.plan(
+                                    controller.state(), goal, quat, controller.grid
+                                )
+                        except PlanningError as exc:
+                            recovery_stop = "planning_failed"
+                            LOG.warning("Recovery planning failed; continuing MPC: %s", exc)
+                        else:
+                            recovery = RecoveryPlan(trajectory, step_key, sim.time, sim.time)
+                            recovery_stop = None
+                            task.timeout = max(
+                                task.timeout, sim.time - task.entered + trajectory.duration + 15.0
+                            )
+                            LOG.info(
+                                "t=%.2f recovery plan duration=%.2fs", sim.time, trajectory.duration
+                            )
+                    if recovery is not None and sim.time + 1e-9 >= recovery.next_seed_time:
+                        start_time = sim.time - recovery.started
+                        with step_profiler.span("planning.seed", gpu=True):
+                            recovery.goal, recovery.quaternion = controller.set_seed(
+                                recovery.trajectory, start_time=start_time
+                            )
+                        recovery.next_seed_time = sim.time + controller.seed_duration
+                        seed_updates += 1
+                        LOG.debug(
+                            "t=%.2f MPC seed for %s: plan offset=%.2fs",
+                            sim.time,
+                            task.goal_step,
+                            start_time,
+                        )
+                    sim.display_status(
+                        f"Task: {task.phase} / {task.step} | Cycles: {task.cycles} | "
+                        f"{args.controller} | Recovery: {'seed' if recovery is not None else 'off'} | "
+                        f"Plans: {plans} | Seeds: {seed_updates}"
+                    )
                     controller_stage = (
                         "mpc.total" if args.controller == "curobo" else "bullet_ik.total"
                     )
+                    # Recovery follows the current plan window's endpoint pose.
+                    # After cancellation, immediately resume the latest task goal.
+                    mpc_goal, mpc_quat = (
+                        (recovery.goal, recovery.quaternion)
+                        if recovery is not None
+                        else (goal, quat)
+                    )
                     with step_profiler.span(controller_stage):
-                        command = controller.command(goal, quat, profiler=step_profiler)
+                        command = controller.command(mpc_goal, mpc_quat, profiler=step_profiler)
                         if not np.isfinite(command).all():
                             raise RuntimeError("Non-finite controller command")
                     with step_profiler.span("sim_step.total"):
@@ -177,10 +289,16 @@ def run(args):
                             "cycles": task.cycles,
                             "goal": goal.tolist(),
                             "goal_quaternion_xyzw": quat.tolist(),
+                            "mpc_goal": mpc_goal.tolist(),
+                            "mpc_goal_quaternion_xyzw": mpc_quat.tolist(),
                             "hand": sim.hand_pose()[0].tolist(),
                             "detections": detections,
                             "collision_steps": collisions,
                             "mpc_failures": getattr(controller, "failures", 0),
+                            "plans": plans,
+                            "seed_updates": seed_updates,
+                            "recovery_active": recovery is not None,
+                            "recovery_stop": recovery_stop,
                             "kalman_updates": tracker.updates,
                             "observation_position": (
                                 last_observation.position.tolist()
@@ -229,6 +347,8 @@ def run(args):
                 Image.fromarray(sim.camera.capture(sim.time).rgb).save(args.output / "camera.png")
             summary = {
                 "controller": args.controller,
+                "plans": plans,
+                "seed_updates": seed_updates,
                 "grasp_mode": "handle_top_down",
                 "camera_eye": sim.camera.pose[:3, 3].tolist() if sim is not None else None,
                 "perception": args.perception,
@@ -248,6 +368,10 @@ def run(args):
             LOG.info("Run summary: %s", summary)
         finally:
             try:
+                if planner is not None:
+                    planner.close()
+                if isinstance(controller, CuroboMPC):
+                    controller.close()
                 if sim is not None:
                     sim.close()
             finally:

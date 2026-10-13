@@ -10,6 +10,18 @@ from .simulation import HAND_TO_GRASP, STATIONS
 LOG = logging.getLogger(__name__)
 GRASP_PREDICTION_SECONDS = 2.0
 CLEARANCE_HEIGHT = 0.65
+POSITION_TOLERANCES = {
+    "preapproach": 0.025,
+    "approach": 0.02,
+    "descend": 0.02,
+    "close": 0.02,
+    "lift": 0.025,
+    "transfer": 0.025,
+    "lower": 0.012,
+    "open": 0.012,
+    "retreat": 0.025,
+    "home": 0.02,
+}
 
 PHASES = {
     "preapproach": "pick",
@@ -30,6 +42,9 @@ class PickPlace:
         self.phase = "pick"
         self.step = "preapproach"
         self.entered = 0.0
+        self.goal_step = self.step
+        self.goal_entered = self.entered
+        self.timeout = 25.0
         self.cycles = 0
         self.destination = 1
         self.pick = None
@@ -48,6 +63,18 @@ class PickPlace:
             LOG.info("t=%.2f %s -> %s (cycles=%d)", now, self.phase, phase, self.cycles)
         LOG.debug("t=%.2f %s -> %s", now, self.step, step)
         self.phase, self.step, self.entered = phase, step, now
+        self.timeout = 25.0
+
+    @property
+    def goal_tolerances(self):
+        # Only HOME requires orientation for task completion. Other waypoints
+        # advance on position; close/open perform their own gripper waits.
+        return np.array(
+            [
+                POSITION_TOLERANCES[self.goal_step],
+                0.05 if self.goal_step == "home" else np.inf,
+            ]
+        )
 
     def update(self, sim, estimate):
         now = sim.time
@@ -84,6 +111,7 @@ class PickPlace:
                     elif self.pick is not None:
                         self.goal[2] = max(hand[2], CLEARANCE_HEIGHT)
                     self.entered = now
+                    self.goal_step, self.goal_entered = self.step, self.entered
                     return self.goal.copy(), self.quaternion, self.grip
         handle, grasp_quaternion = handle_grasp_pose(
             self.pick if self.pick is not None else np.zeros(3), self.grasp_yaw
@@ -91,19 +119,20 @@ class PickPlace:
         place_handle, _ = handle_grasp_pose(STATIONS[self.destination], self.grasp_yaw)
         if self.step != "home":
             self.quaternion = grasp_quaternion
+        self.goal_step, self.goal_entered = self.step, self.entered
         elapsed = now - self.entered
         if self.step == "preapproach":
             self.goal = np.array([handle[0], handle[1], CLEARANCE_HEIGHT])
-            if np.linalg.norm(hand - self.goal) < 0.025:
+            if np.linalg.norm(hand - self.goal) < self.goal_tolerances[0]:
                 self.transition("approach", now)
         elif self.step == "approach":
             self.grip = 0.04
             self.goal = handle + [0, 0, HAND_TO_GRASP + 0.15]
-            if np.linalg.norm(hand - self.goal) < 0.02:
+            if np.linalg.norm(hand - self.goal) < self.goal_tolerances[0]:
                 self.transition("descend", now)
         elif self.step == "descend":
             self.goal = handle + [0, 0, HAND_TO_GRASP]
-            if np.linalg.norm(hand - self.goal) < 0.020:
+            if np.linalg.norm(hand - self.goal) < self.goal_tolerances[0]:
                 self.transition("close", now)
         elif self.step == "close":
             self.goal = handle + [0, 0, HAND_TO_GRASP]
@@ -116,15 +145,15 @@ class PickPlace:
                 self.grip = 0.04
         elif self.step == "lift":
             self.goal = np.array([handle[0], handle[1], CLEARANCE_HEIGHT])
-            if np.linalg.norm(hand - self.goal) < 0.025:
+            if np.linalg.norm(hand - self.goal) < self.goal_tolerances[0]:
                 self.transition("transfer", now)
         elif self.step == "transfer":
             self.goal = np.array([*place_handle[:2], CLEARANCE_HEIGHT])
-            if np.linalg.norm(hand - self.goal) < 0.025:
+            if np.linalg.norm(hand - self.goal) < self.goal_tolerances[0]:
                 self.transition("lower", now)
         elif self.step == "lower":
             self.goal = place_handle + [0, 0, HAND_TO_GRASP + 0.006]
-            if np.linalg.norm(hand - self.goal) < 0.012:
+            if np.linalg.norm(hand - self.goal) < self.goal_tolerances[0]:
                 sim.release()
                 self.transition("open", now)
         elif self.step == "open":
@@ -133,7 +162,7 @@ class PickPlace:
                 self.transition("retreat", now)
         elif self.step == "retreat":
             self.goal = np.array([*place_handle[:2], CLEARANCE_HEIGHT])
-            if np.linalg.norm(hand - self.goal) < 0.025:
+            if np.linalg.norm(hand - self.goal) < self.goal_tolerances[0]:
                 # Validate release before restarting the kinematic platform motion.
                 import pybullet as p
 
@@ -148,14 +177,14 @@ class PickPlace:
         elif self.step == "home":
             self.goal = self.home.copy()
             self.quaternion = self.home_quaternion.copy()
-            if np.linalg.norm(hand - self.home) < 0.02 and abs(
+            if np.linalg.norm(hand - self.home) < self.goal_tolerances[0] and abs(
                 np.dot(hand_quaternion, self.home_quaternion)
-            ) > np.cos(0.05 / 2):
+            ) > np.cos(self.goal_tolerances[1] / 2):
                 self.cycles += 1
                 self.pick = None
                 self.have_grasp_yaw = False
                 self.transition("preapproach", now)
-        if now - self.entered > 25:
+        if now - self.entered > self.timeout:
             raise RuntimeError(
                 f"Task stuck in {self.phase}/{self.step}; inspect perception and MPC diagnostics"
             )

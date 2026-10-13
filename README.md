@@ -28,6 +28,7 @@ The trained weights are included at `weights/cup-handle-seg.pt` and loaded by de
 The first run may take longer while CUDA kernels compile.
 
 The GUI opens by default. The loop is **pick → place → go home → repeat**.
+The current task phase, step, and completed cycles are shown in the scene.
 Press **Ctrl-C** to stop. Images and logs are saved to `outputs/`.
 
 For a lighter remote GUI, add `--gui-light`. This hides debug previews and disables

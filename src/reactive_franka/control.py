@@ -6,6 +6,7 @@ from scipy.ndimage import binary_dilation
 from scipy.spatial.transform import Rotation
 
 from .profiling import DISABLED_PROFILER
+from .seed import fit_cubic_seed
 
 
 def mapping_depth(frame, robot_id, target_mask):
@@ -88,6 +89,7 @@ class CuroboMPC:
         )
         robot["robot_cfg"]["kinematics"]["cspace"]["velocity_scale"] = 0.25
         robot["robot_cfg"]["kinematics"]["cspace"]["max_acceleration"] = 4.0
+        self.robot_config = robot
         cfg = ModelPredictiveControlCfg.create(
             robot=robot,
             scene_model=Scene(voxel=[self.grid]),
@@ -159,6 +161,43 @@ class CuroboMPC:
                 # Keep the scene tensor address stable for captured CUDA graphs.
                 self.grid.feature_tensor.copy_(grid.feature_tensor)
 
+    @property
+    def seed_duration(self):
+        """Physical duration of the MPC seed's usable, unpadded window."""
+        transition = self.mpc.transition_model
+        return transition.n_knots * transition.dt
+
+    def set_seed(self, trajectory, *, start_time=0.0):
+        """Seed a window and return the Cartesian pose of its endpoint."""
+        from curobo.types import JointState
+
+        state = self.state()
+        transition = self.mpc.transition_model
+        if transition.control_space.name != "BSPLINE_3":
+            raise RuntimeError("Motion-plan seeds require cubic B-spline MPC")
+        order = [trajectory.joint_names.index(name) for name in self.mpc.joint_names]
+        initial = self.torch.stack([state.position, state.velocity, state.acceleration])
+        seed = fit_cubic_seed(
+            trajectory.positions[:, order],
+            trajectory.dt,
+            initial.detach().cpu().numpy().reshape(3, -1),
+            transition.dt,
+            transition.n_knots,
+            transition.interpolation_steps,
+            start_time=start_time,
+        )
+        self.mpc.update_seed_trajectory(self.tensor(seed)[None])
+        endpoint = trajectory.sample(start_time + self.seed_duration, initial_dt=transition.dt)[
+            order
+        ]
+        goal_state = JointState.from_position(
+            self.tensor(endpoint)[None], joint_names=self.mpc.joint_names
+        )
+        pose = self.mpc.compute_kinematics(goal_state).tool_poses.to_dict()[self.mpc.tool_frames[0]]
+        position = pose.position.detach().cpu().numpy().reshape(3)
+        quat_wxyz = pose.quaternion.detach().cpu().numpy().reshape(4)
+        return position, quat_wxyz[[1, 2, 3, 0]]
+
     def command(self, position, quat_xyzw, *, profiler=DISABLED_PROFILER):
         from curobo.types import GoalToolPose, Pose
 
@@ -207,3 +246,6 @@ class CuroboMPC:
             self.sim.ideal_trajectory = action.position[0, :, self.indices].detach().cpu().numpy()
             self.sim.ideal_velocity = action.velocity[0, :, self.indices].detach().cpu().numpy()
             return target
+
+    def close(self):
+        self.mpc.destroy()
