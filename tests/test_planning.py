@@ -9,20 +9,17 @@ from reactive_franka.seed import JointTrajectory, cubic_rollout_matrix, fit_cubi
 from reactive_franka.task import PickPlace
 
 
-def test_transition_goal_belongs_to_previous_step_until_next_update():
+def test_transition_returns_current_step_goal_immediately():
     task, sim = PickPlace(), Sim()
     goal, _, _ = task.update(sim, observation())
     sim.hand = goal.copy()
     sim.time = 0.1
-    old_goal, _, _ = task.update(sim, observation(sim.time))
-    assert task.step == "approach"
-    assert task.goal_step == "preapproach"
-    np.testing.assert_allclose(old_goal, goal)
-    sim.time += 1 / 30
     new_goal, _, _ = task.update(sim, observation(sim.time))
-    assert task.goal_step == task.step == "approach"
-    assert task.goal_entered == task.entered
-    assert new_goal[2] < old_goal[2]
+    assert task.step == "approach"
+    assert task.entered == sim.time
+    assert new_goal[2] < goal[2]
+    sim.time += 1 / 30
+    np.testing.assert_allclose(task.update(sim, observation(sim.time))[0], new_goal)
 
 
 def test_long_planned_step_has_budget_but_next_step_resets_it():
@@ -99,8 +96,6 @@ def test_main_only_plans_on_stall_and_stops_recovery_without_replanning(
         phase="go_home",
         step="home",
         entered=0.0,
-        goal_step="home",
-        goal_entered=0.0,
         waiting_for_target=False,
         cycles=0,
         timeout=25,
@@ -109,8 +104,8 @@ def test_main_only_plans_on_stall_and_stops_recovery_without_replanning(
 
     def update(sim, tracked):
         if case == "step_changed" and round(sim.time * 30) >= 110:
-            task.step = task.goal_step = "retreat"
-            task.entered = task.goal_entered = 110 / 30
+            task.step = "retreat"
+            task.entered = 110 / 30
         goal = np.zeros(3) if case == "normal" else np.array([0.2, 0, 0])
         return goal, np.array([1, 0, 0, 0]), 0.04
 
@@ -173,7 +168,7 @@ def test_main_only_plans_on_stall_and_stops_recovery_without_replanning(
             pass
 
     def plan(*args):
-        plan_calls.append(task.goal_step)
+        plan_calls.append(task.step)
         if case == "plan_failed":
             raise PlanningError("No route")
         return JointTrajectory(np.zeros((41 if case == "plan_finished" else 101, 7)), 0.025, [])

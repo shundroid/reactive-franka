@@ -193,12 +193,10 @@ def run(args):
                         Image.fromarray(sim.camera.capture(sim.time).rgb).save(
                             args.output / "handle-grasp.png"
                         )
-                    step_key = (task.goal_step, task.goal_entered)
+                    step_key = (task.step, task.entered)
                     hand, hand_quat = sim.hand_pose()
                     if recovery is not None:
-                        stop_reason = recovery.stop_reason(
-                            (task.step, task.entered), sim.time, hand, hand_quat
-                        )
+                        stop_reason = recovery.stop_reason(step_key, sim.time, hand, hand_quat)
                         if stop_reason is not None:
                             LOG.info(
                                 "t=%.2f recovery ended: %s; continuing MPC", sim.time, stop_reason
@@ -220,13 +218,12 @@ def run(args):
                             planner is not None
                             and recovery is None
                             and not task.waiting_for_target
-                            and task.goal_step not in ("close", "open")
-                            and step_key == (task.step, task.entered)
+                            and task.step not in ("close", "open")
                         ),
                     )
                     if stalled:
                         plans += 1
-                        LOG.info("t=%.2f stalled %s; planning once", sim.time, task.goal_step)
+                        LOG.info("t=%.2f stalled %s; planning once", sim.time, task.step)
                         try:
                             with step_profiler.span("planning.total", gpu=True):
                                 trajectory = planner.plan(
@@ -255,7 +252,7 @@ def run(args):
                         LOG.debug(
                             "t=%.2f MPC seed for %s: plan offset=%.2fs",
                             sim.time,
-                            task.goal_step,
+                            task.step,
                             start_time,
                         )
                     sim.display_status(

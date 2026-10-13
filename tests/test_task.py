@@ -1,5 +1,6 @@
 import numpy as np
 import pybullet as p
+import pytest
 
 from reactive_franka.geometry import HANDLE_CLOSED_GRIP, HANDLE_GRASP, handle_grasp_pose
 from reactive_franka.simulation import HAND_TO_GRASP, STATIONS
@@ -66,14 +67,13 @@ def test_gripper_occlusion_does_not_restart_pick():
     goal, _, grip = task.update(sim, estimate)
     assert task.phase == "place" and sim.attached
     assert grip == HANDLE_CLOSED_GRIP
-    np.testing.assert_allclose(goal, sim.hand)
+    np.testing.assert_allclose(goal, [*sim.hand[:2], CLEARANCE_HEIGHT])
 
 
 def test_cycle_counts_only_after_return_home(monkeypatch):
     task, sim = PickPlace(), Sim()
     home = sim.hand.copy()
     sim.quat = np.array([np.cos(0.1), np.sin(0.1), 0, 0])
-    home_quaternion = sim.quat.copy()
     monkeypatch.setattr(
         p, "getBasePositionAndOrientation", lambda *a, **kw: (STATIONS[1], sim.quat)
     )
@@ -93,7 +93,111 @@ def test_cycle_counts_only_after_return_home(monkeypatch):
     assert phases == ["pick", "place", "go_home", "pick"]
     assert task.cycles == 1
     np.testing.assert_allclose(sim.hand, home)
-    np.testing.assert_allclose(quat, home_quaternion)
+    assert not task.waiting_for_target and task.step == "preapproach"
+    _, expected_quaternion = handle_grasp_pose(STATIONS[0], 0)
+    np.testing.assert_allclose(quat, expected_quaternion)
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("preapproach", "approach"),
+        ("approach", "descend"),
+        ("descend", "close"),
+        ("close", "lift"),
+        ("lift", "transfer"),
+        ("transfer", "lower"),
+        ("lower", "open"),
+        ("open", "retreat"),
+        ("retreat", "home"),
+        ("home", "preapproach"),
+    ],
+)
+def test_transition_frame_returns_new_goal_pose_grip_and_tolerances(monkeypatch, before, after):
+    task, sim = PickPlace(), Sim()
+    sim.quat = np.array([np.cos(0.1), np.sin(0.1), 0, 0])
+    task.update(sim, observation())
+    task.transition(before, 0)
+    handle, grasp_quat = handle_grasp_pose(STATIONS[0], 0)
+    place_handle, _ = handle_grasp_pose(STATIONS[1], 0)
+    goals = {
+        "preapproach": np.array([*handle[:2], CLEARANCE_HEIGHT]),
+        "approach": handle + [0, 0, HAND_TO_GRASP + 0.15],
+        "descend": handle + [0, 0, HAND_TO_GRASP],
+        "close": handle + [0, 0, HAND_TO_GRASP],
+        "lift": np.array([*handle[:2], CLEARANCE_HEIGHT]),
+        "transfer": np.array([*place_handle[:2], CLEARANCE_HEIGHT]),
+        "lower": place_handle + [0, 0, HAND_TO_GRASP + 0.006],
+        "open": place_handle + [0, 0, HAND_TO_GRASP + 0.006],
+        "retreat": np.array([*place_handle[:2], CLEARANCE_HEIGHT]),
+        "home": task.home.copy(),
+    }
+    calls = []
+    monkeypatch.setattr(sim, "attach", lambda: calls.append("attach") or True)
+    monkeypatch.setattr(sim, "release", lambda: calls.append("release"))
+    monkeypatch.setattr(
+        sim, "resume_target_motion", lambda station: calls.append(("resume", station))
+    )
+    monkeypatch.setattr(
+        p, "getBasePositionAndOrientation", lambda *a, **kw: (STATIONS[1], sim.quat)
+    )
+    sim.time, sim.hand = 1.0, goals[before].copy()
+    sim.quat = task.home_quaternion.copy() if before == "home" else grasp_quat.copy()
+    goal, quat, grip = task.update(sim, observation(sim.time))
+    assert task.step == after and task.entered == sim.time
+    np.testing.assert_allclose(goal, goals[after])
+    np.testing.assert_allclose(quat, task.home_quaternion if after == "home" else grasp_quat)
+    assert grip == (HANDLE_CLOSED_GRIP if after in ("close", "lift", "transfer", "lower") else 0.04)
+    assert task.goal_tolerances[0] == (
+        0.012
+        if after in ("lower", "open")
+        else 0.025
+        if after in ("preapproach", "lift", "transfer", "retreat")
+        else 0.02
+    )
+    assert task.goal_tolerances[1] == (0.05 if after == "home" else np.inf)
+    expected_calls = {"close": ["attach"], "lower": ["release"], "retreat": [("resume", 1)]}
+    assert calls == expected_calls.get(before, [])
+    assert task.cycles == int(before == "home")
+
+
+def test_missed_grasp_returns_reopened_clearance_goal_and_new_step_identity(monkeypatch):
+    task, sim = PickPlace(), Sim()
+    task.update(sim, observation())
+    task.transition("close", 0)
+    monkeypatch.setattr(sim, "attach", lambda: False)
+    sim.time = 2.1
+    goal, _, grip = task.update(sim, observation(sim.time))
+    assert task.step == "preapproach" and task.entered == 2.1 and task.timeout == 25
+    handle, _ = handle_grasp_pose(STATIONS[0], 0)
+    np.testing.assert_allclose(goal, [*handle[:2], CLEARANCE_HEIGHT])
+    assert grip == 0.04
+
+
+def test_home_completion_without_observation_returns_waiting_pick_goal():
+    task, sim = PickPlace(), Sim()
+    task.update(sim, observation())
+    task.transition("home", 0)
+    sim.hand, sim.quat, sim.time = task.home.copy(), task.home_quaternion.copy(), 1.0
+    goal, quat, grip = task.update(sim, None)
+    assert task.cycles == 1 and task.step == "preapproach" and task.waiting_for_target
+    assert task.entered == sim.time
+    np.testing.assert_allclose(goal, sim.hand)
+    np.testing.assert_allclose(quat, sim.quat)
+    assert grip == 0.04
+
+
+def test_timeout_applies_to_current_step_but_waiting_perception_resets_budget():
+    task, sim = PickPlace(), Sim()
+    task.update(sim, observation())
+    task.transition("home", 0)
+    sim.hand += [0.1, 0, 0]
+    sim.time = 25.1
+    with pytest.raises(RuntimeError, match="go_home/home"):
+        task.update(sim, None)
+    task.transition("preapproach", 0)
+    task.update(sim, None)
+    assert task.waiting_for_target and task.entered == sim.time
 
 
 def test_descent_tracks_faster_cup_and_long_occlusion_clears_camera_view():
