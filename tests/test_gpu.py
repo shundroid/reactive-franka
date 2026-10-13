@@ -65,5 +65,16 @@ def test_voxel_stride_fk_and_live_updates(tmp_path):
             controller.update_map(frame, estimate.mask if estimate is not None else None)
         assert torch.count_nonzero(before != controller.grid.feature_tensor).item() > 100
         assert voxels.features.data_ptr() == controller.grid.feature_tensor.data_ptr()
+        before_yellow = controller.grid.feature_tensor.clone()
+        p.resetBasePositionAndOrientation(
+            sim.yellow_obstacle, [0.30, 0, 0.35], [0, 0, 0, 1], physicsClientId=sim.client
+        )
+        for index in range(6):
+            frame = sim.camera.capture(0.6 + index / 10)
+            estimate = perception.estimate(frame)
+            controller.update_map(frame, estimate.mask if estimate is not None else None)
+        assert np.count_nonzero(frame.body_ids == sim.yellow_obstacle) > 100
+        assert torch.count_nonzero(before_yellow != controller.grid.feature_tensor).item() > 100
+        assert voxels.features.data_ptr() == controller.grid.feature_tensor.data_ptr()
     finally:
         sim.close()

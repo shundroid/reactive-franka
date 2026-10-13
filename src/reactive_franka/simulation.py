@@ -14,13 +14,16 @@ STATIONS = (np.array([0.52, -0.23, 0.051]), np.array([0.52, 0.23, 0.051]))
 HAND_TO_GRASP = 0.105
 CUP_TRAVEL = 0.10  # meters either side of the placement point
 CUP_ANGULAR_SPEED = 0.55  # rad/s; peak speed 5.5 cm/s, matching the red obstacle
+YELLOW_HEIGHT_LIMITS = (0.03, 0.85)
+YELLOW_Y_LIMITS = (-0.45, 0.45)  # Keep the 50 cm bar inside the RGB-D map's Y extent.
+YELLOW_SPEED = 0.40  # m/s of simulation time
 
 
 class Simulation:
     def __init__(self, gui: bool, output: Path, gui_light: bool = False):
         self.gui = gui
         self.status_text = None
-        self.status_item = -1
+        self.status_items = [-1, -1]
         self.client = p.connect(p.GUI if gui else p.DIRECT)
         if self.client < 0:
             raise RuntimeError("Could not connect to PyBullet")
@@ -59,7 +62,13 @@ class Simulation:
         self.table = self.box([0.48, 0, -0.04], [0.43, 0.48, 0.04], [0.68, 0.58, 0.45, 1])
         self.obstacle = self.box([0.52, 0, 0.16], [0.035, 0.055, 0.16], [0.85, 0.15, 0.12, 1])
         self.air_obstacles = (self.box([0.62, 0, 0.43], [0.035, 0.04, 0.04], [0.15, 0.4, 0.9, 1]),)
-        self.obstacles = (self.obstacle, *self.air_obstacles)
+        self.yellow_height = YELLOW_HEIGHT_LIMITS[0]
+        self.yellow_y = 0.0
+        self.yellow_obstacle = self.box(
+            [0.30, self.yellow_y, self.yellow_height], [0.04, 0.25, 0.03], [0.95, 0.85, 0.08, 1]
+        )
+        self._arrow_keys = set()
+        self.obstacles = (self.obstacle, *self.air_obstacles, self.yellow_obstacle)
         output.mkdir(parents=True, exist_ok=True)
         mesh_path = output / "cup.obj"
         cup_mesh().export(mesh_path)
@@ -92,17 +101,45 @@ class Simulation:
         p.resetDebugVisualizerCamera(1.5, 45, -35, [0.4, 0, 0.2], physicsClientId=self.client)
 
     def display_status(self, text: str):
-        if not self.gui or text == self.status_text:
+        lines = (text, f"Yellow y={self.yellow_y:.2f} z={self.yellow_height:.2f}m (Arrows)")
+        if not self.gui or lines == self.status_text:
             return
-        self.status_item = p.addUserDebugText(
-            text,
-            [0.0, 0.0, 1.0],
-            textColorRGB=[0.05, 0.05, 0.05],
-            textSize=1.3,
-            replaceItemUniqueId=self.status_item,
+        for index, line in enumerate(lines):
+            self.status_items[index] = p.addUserDebugText(
+                line,
+                [0.0, 0.0, 1.0 - 0.07 * index],
+                textColorRGB=[0.05, 0.05, 0.05],
+                textSize=1.3,
+                replaceItemUniqueId=self.status_items[index],
+                physicsClientId=self.client,
+            )
+        self.status_text = lines
+
+    def update_keyboard(self, dt: float):
+        """Move the yellow box in Y/Z while arrows are held; ignore input headless."""
+        if not self.gui:
+            return
+        events = p.getKeyboardEvents(physicsClientId=self.client)
+        for key in (p.B3G_UP_ARROW, p.B3G_DOWN_ARROW, p.B3G_LEFT_ARROW, p.B3G_RIGHT_ARROW):
+            state = events.get(key, 0)
+            if state & p.KEY_WAS_RELEASED:
+                self._arrow_keys.discard(key)
+            elif state & p.KEY_IS_DOWN:
+                self._arrow_keys.add(key)
+        dz = int(p.B3G_UP_ARROW in self._arrow_keys) - int(p.B3G_DOWN_ARROW in self._arrow_keys)
+        dy = int(p.B3G_RIGHT_ARROW in self._arrow_keys) - int(p.B3G_LEFT_ARROW in self._arrow_keys)
+        if dy == 0 and dz == 0:
+            return
+        self.yellow_y = float(np.clip(self.yellow_y + dy * YELLOW_SPEED * dt, *YELLOW_Y_LIMITS))
+        self.yellow_height = float(
+            np.clip(self.yellow_height + dz * YELLOW_SPEED * dt, *YELLOW_HEIGHT_LIMITS)
+        )
+        p.resetBasePositionAndOrientation(
+            self.yellow_obstacle,
+            [0.30, self.yellow_y, self.yellow_height],
+            [0, 0, 0, 1],
             physicsClientId=self.client,
         )
-        self.status_text = text
 
     def box(self, position, half, color):
         c = p.createCollisionShape(p.GEOM_BOX, halfExtents=half, physicsClientId=self.client)
@@ -131,7 +168,7 @@ class Simulation:
             [0.52 + 0.10 * np.sin(0.55 * time), 0, 0.16],
             [0.62, 0.12 * np.sin(0.45 * time), 0.43],
         )
-        for body, position in zip(self.obstacles, positions):
+        for body, position in zip((self.obstacle, *self.air_obstacles), positions):
             p.resetBasePositionAndOrientation(
                 body, position, [0, 0, 0, 1], physicsClientId=self.client
             )

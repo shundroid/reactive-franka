@@ -114,6 +114,8 @@ def test_main_only_plans_on_stall_and_stops_recovery_without_replanning(
     frame = SimpleNamespace(rgb=np.zeros((2, 2, 3), dtype=np.uint8), timestamp=0)
 
     class Scene:
+        yellow_height = 0.03
+
         def __init__(self, *args, **kwargs):
             self.time, self.cup, self.robot, self.constraint = 0.0, 1, 0, None
             self.camera = SimpleNamespace(pose=np.eye(4), capture=lambda _: frame)
@@ -122,6 +124,9 @@ def test_main_only_plans_on_stall_and_stops_recovery_without_replanning(
 
         def step(self, *args):
             self.time += 1 / 30
+
+        def update_keyboard(self, dt):
+            pass
 
         def collision_count(self):
             return 0

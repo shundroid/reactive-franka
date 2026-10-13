@@ -135,6 +135,7 @@ def run(args):
                 )
                 with step_profiler.span("step.total@" + step_type):
                     tick_started = time.monotonic()
+                    sim.update_keyboard(1 / 30)
                     # Camera + YOLO + ICP + mapping at 10 Hz; arm control and physics at 30/240 Hz.
                     if perform_perception:
                         if steps > 0:
@@ -291,6 +292,7 @@ def run(args):
                             "hand": sim.hand_pose()[0].tolist(),
                             "detections": detections,
                             "collision_steps": collisions,
+                            "yellow_height": sim.yellow_height,
                             "mpc_failures": getattr(controller, "failures", 0),
                             "plans": plans,
                             "seed_updates": seed_updates,

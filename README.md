@@ -29,6 +29,11 @@ The first run may take longer while CUDA kernels compile.
 
 The GUI opens by default. The loop is **pick → place → go home → repeat**.
 The current task phase, step, and completed cycles are shown in the scene.
+Click inside the GUI and hold **Up/Down** to raise/lower the yellow bar in front of
+the robot, or **Left/Right** to move it along Y. It starts on the table and stops
+when released. Both axes use `YELLOW_SPEED` (m/s of simulation time) in
+`src/reactive_franka/simulation.py`. This also works through noVNC; headless runs
+leave it at its initial position.
 Press **Ctrl-C** to stop. Images and logs are saved to `outputs/`.
 
 For a lighter remote GUI, add `--gui-light`. This hides debug previews and disables
